@@ -132,7 +132,7 @@
 <body>
 <header>
   <h1>聚合口摘链演练</h1>
-  <span class="sub">两条 FIFO 链路 · 送达/确认延时可变 · 摘链一次一个</span>
+  <span class="sub">两条成员链路 · 发送窗口 1~64 在线可调 · 送达/确认延时可变 · 摘链一次一个</span>
   <span class="grow"></span>
   <span id="health" class="pill">连接中…</span>
   <button id="btn-reset" class="danger">重置演练</button>
@@ -145,6 +145,7 @@
       <div class="tight"><label>链路</label><span class="pill linkA">A</span></div>
       <div><label>送达延时 (ms)</label><input id="a-delivery" type="number" min="0" value="300"></div>
       <div><label>确认延时 (ms)</label><input id="a-ack" type="number" min="0" value="200"></div>
+      <div class="tight" style="flex:0 0 92px;"><label>窗口 (1-64)</label><input id="a-window" type="number" min="1" max="64" value="1"></div>
       <div class="tight"><button data-link="A">应用</button></div>
     </div>
     <div class="spacer"></div>
@@ -152,11 +153,12 @@
       <div class="tight"><label>链路</label><span class="pill linkB">B</span></div>
       <div><label>送达延时 (ms)</label><input id="b-delivery" type="number" min="0" value="150"></div>
       <div><label>确认延时 (ms)</label><input id="b-ack" type="number" min="0" value="80"></div>
+      <div class="tight" style="flex:0 0 92px;"><label>窗口 (1-64)</label><input id="b-window" type="number" min="1" max="64" value="1"></div>
       <div class="tight"><button data-link="B">应用</button></div>
     </div>
     <div class="spacer"></div>
     <div id="link-status" class="kv small"></div>
-    <div class="hint">延时在报文开始处理时读取；对已在途报文不影响。</div>
+    <div class="hint">传输耗时取报文<b>发出时</b>的送达设置；确认延时在报文物理到达时按当时设置取值，确认返回才释放窗口名额。后发先到的报文会在链路重排缓冲里等前包，仍按链路顺序交给收端。窗口调低立即生效，已在途报文继续处理。</div>
   </section>
 
   <section class="panel">
@@ -175,6 +177,8 @@
       <div><label>载荷（可选）</label><input id="send-payload" placeholder="hello"></div>
       <div class="tight"><button id="btn-send" class="primary">发送</button></div>
       <div class="tight"><button id="btn-send-3">连发 3 个</button></div>
+      <div class="tight" style="flex:0 0 84px;"><label>连发数量</label><input id="send-count" type="number" min="1" max="1000" value="10"></div>
+      <div class="tight"><button id="btn-send-n">连发 N 个</button></div>
     </div>
     <div class="spacer"></div>
     <div class="scroll"><table>
@@ -294,9 +298,13 @@ function renderLinks(links) {
     k.textContent = `链路 ${link.id}`;
     const v = document.createElement("span");
     v.className = "mono";
+    const inflightIds = link.in_flight_packet_ids || link.in_flight || [];
     v.textContent =
-      `队列 ${link.queue_depth} · 已交付 ${link.delivered} · 已确认 ${link.acked} · ` +
+      `窗口 ${link.window_size}/64 · 在途 ${link.in_flight_count} 包` +
+      (inflightIds.length ? ` [${inflightIds.join(", ")}]` : "") +
+      ` · 待发队列 ${link.queue_depth} · 已交付 ${link.delivered} · 已确认 ${link.acked} · ` +
       `状态 ${link.current_phase}${link.current_packet_id ? " (" + link.current_packet_id + ")" : ""}`;
+    if (inflightIds.length) v.title = "已发未确认（按发出顺序）：\n" + inflightIds.join("\n");
     box.appendChild(k);
     box.appendChild(v);
   }
@@ -510,13 +518,19 @@ function bind() {
     btn.addEventListener("click", async () => {
       const id = btn.dataset.link;
       const prefix = id.toLowerCase();
+      const windowSize = Number($(prefix + "-window").value);
+      if (!Number.isInteger(windowSize) || windowSize < 1 || windowSize > 64) {
+        logLine(`链路 ${id} 窗口必须是 1~64 的整数`, "err");
+        return;
+      }
       const body = {
         delivery_delay_ms: Number($(prefix + "-delivery").value),
         ack_delay_ms: Number($(prefix + "-ack").value),
+        window_size: windowSize,
       };
       try {
-        await api("PATCH", "/api/links/" + id, body);
-        logLine(`链路 ${id} 延时更新为 送达 ${body.delivery_delay_ms}ms / 确认 ${body.ack_delay_ms}ms`, "ok");
+        const updated = await api("PATCH", "/api/links/" + id, body);
+        logLine(`链路 ${id} 更新为 送达 ${body.delivery_delay_ms}ms / 确认 ${body.ack_delay_ms}ms / 窗口 ${updated.window_size} 包`, "ok");
         refresh();
       } catch (err) { logLine(err.message, "err"); }
     });
@@ -536,6 +550,18 @@ function bind() {
   $("btn-send-3").addEventListener("click", async () => {
     const base = Number($("send-seq").value) || nextSeq();
     for (let i = 0; i < 3; i++) await sendOne(base + i);
+  });
+  $("btn-send-n").addEventListener("click", async () => {
+    const n = Math.max(1, Math.min(1000, Number($("send-count").value) || 1));
+    const base = Number($("send-seq").value) || nextSeq();
+    const btn = $("btn-send-n");
+    btn.disabled = true;
+    try {
+      for (let i = 0; i < n; i++) await sendOne(base + i);
+      logLine(`已连续提交 ${n} 包（seq ${base}..${base + n - 1}）；观察“在途/窗口”与吞吐`, "ok");
+    } finally {
+      btn.disabled = false;
+    }
   });
 
   $("send-flow").addEventListener("change", () => { $("send-seq").value = nextSeq(); });
@@ -560,7 +586,9 @@ function bind() {
   $("btn-reset").addEventListener("click", async () => {
     try {
       await api("POST", "/api/reset");
-      logLine("演练已重置", "ok");
+      $("a-window").value = "1";
+      $("b-window").value = "1";
+      logLine("演练已重置（在途包清空，窗口回到 1）", "ok");
       refresh(); refreshRemovals();
     } catch (err) { logLine(err.message, "err"); }
   });

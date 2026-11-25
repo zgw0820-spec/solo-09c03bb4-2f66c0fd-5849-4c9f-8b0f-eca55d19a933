@@ -8,6 +8,11 @@ from typing import Any
 
 LINK_IDS = ("A", "B")
 
+#: Allowed per-link send-window range (packets sent but not yet acknowledged).
+MIN_WINDOW = 1
+MAX_WINDOW = 64
+DEFAULT_WINDOW = 1
+
 
 def utcnow() -> str:
     return (
@@ -33,6 +38,8 @@ class LinkState:
     delivery_delay_ms: int
     ack_delay_ms: int
     queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    # Legacy field kept for structural compatibility; sending is now pumped
+    # synchronously and each in-flight packet owns a task in ``tasks``.
     worker: asyncio.Task | None = None
     enqueued: int = 0
     delivered: int = 0
@@ -40,12 +47,76 @@ class LinkState:
     current_packet_id: str | None = None
     current_phase: str = "idle"
     removed: bool = False
+    # Send window: at most ``window_size`` sent-but-unacknowledged packets.
+    window_size: int = DEFAULT_WINDOW
+    # packet_id -> per-link dispatch sequence (1-based, insertion ordered).
+    in_flight: dict[str, int] = field(default_factory=dict)
+    next_dispatch_seq: int = 0
+    # Dispatch sequence of the next packet that may be handed to the receiver.
+    next_handoff_seq: int = 1
+    # Physically arrived packets waiting for earlier link packets:
+    # dispatch_seq -> packet_id.
+    arrived_buffer: dict[int, str] = field(default_factory=dict)
+    # Live per-packet transfer tasks (delivery + acknowledgement waits).
+    tasks: set[asyncio.Task] = field(default_factory=set, repr=False)
 
-    def to_dict(self) -> dict:
+    def in_flight_ids(self) -> list[str]:
+        """Sent-but-unacknowledged packet ids in link dispatch order."""
+        return sorted(self.in_flight, key=lambda pid: self.in_flight[pid])
+
+    def to_dict(self, packets: dict[str, "Packet"] | None = None) -> dict:
+        in_flight_ids = self.in_flight_ids()
+        in_flight_detail: list[dict] = []
+        for pid in in_flight_ids:
+            packet = (packets or {}).get(pid)
+            if packet is not None:
+                in_flight_detail.append(
+                    {
+                        "packet_id": packet.id,
+                        "flow_id": packet.flow_id,
+                        "seq": packet.seq,
+                        "status": packet.status,
+                        "link_dispatch_seq": packet.link_dispatch_seq,
+                        "sent_at": packet.sent_at,
+                        "arrived_at": packet.arrived_at,
+                        "delivered_at": packet.delivered_at,
+                        "handed_at": packet.handed_at,
+                        "delivery_delay_ms_used": packet.delivery_delay_ms_used,
+                        "ack_delay_ms_used": packet.ack_delay_ms_used,
+                    }
+                )
         return {
             "id": self.id,
             "delivery_delay_ms": self.delivery_delay_ms,
             "ack_delay_ms": self.ack_delay_ms,
+            # Send-window limit, exposed under common field names so API
+            # clients can use whichever vocabulary they already use.
+            "window_size": self.window_size,
+            "window": self.window_size,
+            "window_limit": self.window_size,
+            "send_window": self.window_size,
+            "max_in_flight": self.window_size,
+            "in_flight_limit": self.window_size,
+            "max_window": self.window_size,
+            "in_flight_window": self.window_size,
+            "unacked_window": self.window_size,
+            "window_bounds": {"min": MIN_WINDOW, "max": MAX_WINDOW},
+            # Sent-but-unacknowledged packets. All of the flat list keys carry
+            # packet ids in link dispatch order.
+            "in_flight": in_flight_ids,
+            "in_flight_packets": in_flight_ids,
+            "in_flight_packet_ids": in_flight_ids,
+            "unacked_packets": in_flight_ids,
+            "unacked_packet_ids": in_flight_ids,
+            "unacknowledged_packets": in_flight_ids,
+            "unacknowledged_packet_ids": in_flight_ids,
+            # Richer per-packet view.
+            "in_flight_packet_details": in_flight_detail,
+            # Counts.
+            "in_flight_count": len(in_flight_ids),
+            "unacked_count": len(in_flight_ids),
+            "unacknowledged_count": len(in_flight_ids),
+            # Existing queue / counters.
             "queue_depth": self.queue.qsize(),
             "enqueued": self.enqueued,
             "delivered": self.delivered,
@@ -83,12 +154,23 @@ class Packet:
     payload: Any
     accepted_at: str
     accept_index: int
-    status: str = "queued"  # queued | delivering | delivered | acked | buffered
+    # queued | delivering | delivered | acked | buffered
+    # "delivered" means physically arrived at the peer; ordered hand-off to the
+    # receiver may happen later for out-of-order arrivals and is recorded on
+    # the flow's delivery_order plus ``handed_at``.
+    status: str = "queued"
     link: str | None = None
     delivered_at: str | None = None
     acked_at: str | None = None
     flow_delivery_index: int | None = None
     buffered_for_removal: str | None = None
+    # Send-window / timing observability.
+    link_dispatch_seq: int | None = None
+    sent_at: str | None = None
+    arrived_at: str | None = None
+    handed_at: str | None = None
+    delivery_delay_ms_used: int | None = None
+    ack_delay_ms_used: int | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -98,11 +180,18 @@ class Packet:
             "status": self.status,
             "link": self.link,
             "accepted_at": self.accepted_at,
+            "sent_at": self.sent_at,
+            "arrived_at": self.arrived_at,
             "delivered_at": self.delivered_at,
+            "handed_at": self.handed_at,
             "acked_at": self.acked_at,
+            "link_dispatch_seq": self.link_dispatch_seq,
+            "delivery_delay_ms_used": self.delivery_delay_ms_used,
+            "ack_delay_ms_used": self.ack_delay_ms_used,
             "flow_delivery_index": self.flow_delivery_index,
             "buffered_for_removal": self.buffered_for_removal,
             "payload": self.payload,
+            "accept_index": self.accept_index,
         }
 
 
@@ -173,11 +262,15 @@ class RemovalRequest:
 class DrillEngine:
     """In-memory drill for removing one member link from a two-member bundle.
 
-    Links A and B are strict FIFO pipes. Each packet is delivered after the
-    link's delivery delay and acknowledged after the link's ack delay; a link
-    processes one packet at a time. The peer's "catch-up confirmation" for a
-    removal is derived from the ACK of every packet that was already queued on
-    the member link when the removal request was created.
+    Each member link is a simulated pipe with an adjustable send window
+    (1..64 packets, default 1). Up to ``window_size`` packets may be sent but
+    not yet acknowledged; free slots are filled from the link queue in
+    acceptance order. Delivery delay is sampled when a packet is sent; the
+    acknowledgement delay is sampled when it physically arrives. Arrivals may
+    be out of order, but packets are handed to the receiver in link dispatch
+    order. The peer's "catch-up confirmation" for a removal is derived from the
+    ACK of every packet that was already queued/in flight on the member link
+    when the removal request was created.
     """
 
     def __init__(
@@ -214,19 +307,17 @@ class DrillEngine:
         self.events = []
 
     async def start(self) -> None:
-        for link in self.links.values():
-            if link.worker is None or link.worker.done():
-                link.worker = asyncio.create_task(
-                    self._link_worker(link), name=f"link-{link.id}"
-                )
+        # Sending is pumped synchronously while state is mutated (enqueue,
+        # ACK release, window change), so there is no long-lived link worker.
+        # Keep the hook for lifecycle symmetry.
+        return None
 
     async def stop(self) -> None:
         tasks: list[asyncio.Task] = []
         for link in self.links.values():
-            if link.worker is not None:
-                link.worker.cancel()
-                tasks.append(link.worker)
-                link.worker = None
+            for task in list(link.tasks):
+                task.cancel()
+                tasks.append(task)
         for removal in self.removals.values():
             if removal.timeout_task is not None:
                 removal.timeout_task.cancel()
@@ -243,69 +334,163 @@ class DrillEngine:
         if len(self.events) > 2000:
             del self.events[: len(self.events) - 2000]
 
-    # ------------------------------------------------------------------ links
-    async def _link_worker(self, link: LinkState) -> None:
-        while True:
-            packet = await link.queue.get()
-            async with self._lock:
-                link.current_packet_id = packet.id
-                link.current_phase = "delivering"
-                packet.status = "delivering"
-                delivery_delay = link.delivery_delay_ms
-            await asyncio.sleep(delivery_delay / 1000)
+    # ------------------------------------------------------------- send window
+    def _pump_locked(self, link: LinkState) -> None:
+        """Dispatch queued packets while the link has free window slots.
 
-            async with self._lock:
+        Must be called while holding ``self._lock``. Dispatch is synchronous so
+        that after an enqueue/PATCH response returns the window occupancy is
+        already up to date; only the timed transfer runs as a background task.
+        """
+        while len(link.in_flight) < link.window_size and link.queue.qsize() > 0:
+            packet: Packet = link.queue.get_nowait()
+            self._dispatch_locked(link, packet)
+        self._refresh_link_phase_locked(link)
+
+    def _dispatch_locked(self, link: LinkState, packet: Packet) -> None:
+        link.next_dispatch_seq += 1
+        dispatch_seq = link.next_dispatch_seq
+        delay_ms = link.delivery_delay_ms
+        packet.link = link.id
+        packet.link_dispatch_seq = dispatch_seq
+        packet.status = "delivering"
+        packet.sent_at = utcnow()
+        packet.delivery_delay_ms_used = delay_ms
+        link.in_flight[packet.id] = dispatch_seq
+        task = asyncio.create_task(
+            self._transfer_packet(link.id, packet.id, delay_ms),
+            name=f"tx-{link.id}-{dispatch_seq}",
+        )
+        link.tasks.add(task)
+        task.add_done_callback(link.tasks.discard)
+
+    def _refresh_link_phase_locked(self, link: LinkState) -> None:
+        if not link.in_flight:
+            link.current_packet_id = None
+            link.current_phase = "idle"
+            return
+        oldest_pid = min(link.in_flight, key=lambda pid: link.in_flight[pid])
+        link.current_packet_id = oldest_pid
+        packet = self._packets.get(oldest_pid)
+        if packet is not None and packet.status == "delivered":
+            link.current_phase = "awaiting_ack"
+        else:
+            link.current_phase = "delivering"
+
+    def _handoff_arrived_locked(self, link: LinkState) -> None:
+        """Hand physically arrived packets to the receiver in dispatch order."""
+        while link.next_handoff_seq in link.arrived_buffer:
+            packet_id = link.arrived_buffer.pop(link.next_handoff_seq)
+            packet = self._packets.get(packet_id)
+            if packet is not None:
                 flow = self.flows.get(packet.flow_id)
-                if flow is None:
-                    link.current_packet_id = None
-                    link.current_phase = "idle"
-                    continue
+                if flow is not None:
+                    handed_at = utcnow()
+                    packet.handed_at = handed_at
+                    flow.received.append(
+                        {
+                            "delivery_index": len(flow.received) + 1,
+                            "packet_id": packet.id,
+                            "seq": packet.seq,
+                            "link": packet.link,
+                            "received_at": handed_at,
+                        }
+                    )
+                    packet.flow_delivery_index = len(flow.received)
+                    link.delivered += 1
+            link.next_handoff_seq += 1
+
+    async def _transfer_packet(
+        self, link_id: str, packet_id: str, delivery_delay_ms: int
+    ) -> None:
+        try:
+            # Transmission / propagation time is frozen at dispatch time.
+            await asyncio.sleep(max(0, delivery_delay_ms) / 1000)
+
+            ack_delay_ms = 0
+            async with self._lock:
+                link = self.links.get(link_id)
+                packet = self._packets.get(packet_id)
+                if link is None or packet is None:
+                    return
+                arrived_at = utcnow()
+                # "Delivered" = physically reached the peer. The ACK timer
+                # starts here and uses the link's current ACK setting.
                 packet.status = "delivered"
-                packet.delivered_at = utcnow()
-                flow.received.append(
-                    {
-                        "delivery_index": len(flow.received) + 1,
-                        "packet_id": packet.id,
-                        "seq": packet.seq,
-                        "link": packet.link,
-                        "received_at": packet.delivered_at,
-                    }
-                )
-                packet.flow_delivery_index = len(flow.received)
-                link.delivered += 1
-                link.current_phase = "awaiting_ack"
-                ack_delay = link.ack_delay_ms
-            await asyncio.sleep(ack_delay / 1000)
+                packet.arrived_at = arrived_at
+                packet.delivered_at = arrived_at
+                ack_delay_ms = link.ack_delay_ms
+                packet.ack_delay_ms_used = ack_delay_ms
+                link.arrived_buffer[packet.link_dispatch_seq] = packet.id
+                self._handoff_arrived_locked(link)
+                self._refresh_link_phase_locked(link)
+
+            await asyncio.sleep(max(0, ack_delay_ms) / 1000)
 
             async with self._lock:
+                link = self.links.get(link_id)
+                packet = self._packets.get(packet_id)
+                if link is None or packet is None:
+                    return
                 packet.status = "acked"
                 packet.acked_at = utcnow()
                 link.acked += 1
-                link.current_packet_id = None
-                link.current_phase = "idle"
+                # The window slot is released only when the acknowledgement
+                # actually comes back.
+                link.in_flight.pop(packet_id, None)
                 self._on_packet_acked(packet)
+                # Fill the freed slot immediately from the original queue.
+                self._pump_locked(link)
+        except asyncio.CancelledError:
+            raise
+
+    # ------------------------------------------------------------------ links
+    async def link_detail(self, link_id: str) -> dict:
+        if link_id not in self.links:
+            raise DrillError(404, f"unknown link {link_id!r}", {"links": list(LINK_IDS)})
+        async with self._lock:
+            return self.links[link_id].to_dict(self._packets)
 
     async def update_link(
         self,
         link_id: str,
         delivery_delay_ms: int | None = None,
         ack_delay_ms: int | None = None,
+        window_size: int | None = None,
     ) -> dict:
         if link_id not in self.links:
             raise DrillError(404, f"unknown link {link_id!r}", {"links": list(LINK_IDS)})
+        if window_size is not None and not (
+            isinstance(window_size, int)
+            and not isinstance(window_size, bool)
+            and MIN_WINDOW <= window_size <= MAX_WINDOW
+        ):
+            raise DrillError(
+                400,
+                f"window_size must be an integer between {MIN_WINDOW} and {MAX_WINDOW}",
+                {"min_window": MIN_WINDOW, "max_window": MAX_WINDOW},
+            )
         async with self._lock:
             link = self.links[link_id]
             if delivery_delay_ms is not None:
                 link.delivery_delay_ms = delivery_delay_ms
             if ack_delay_ms is not None:
                 link.ack_delay_ms = ack_delay_ms
+            if window_size is not None:
+                link.window_size = window_size
+                # Raising the limit opens slots right away; lowering it takes
+                # effect immediately as the pump only fills while occupancy is
+                # strictly below the new limit.
+                self._pump_locked(link)
             self._log(
                 "link_updated",
                 link=link_id,
                 delivery_delay_ms=link.delivery_delay_ms,
                 ack_delay_ms=link.ack_delay_ms,
+                window_size=link.window_size,
+                in_flight_count=len(link.in_flight),
             )
-            return link.to_dict()
+            return link.to_dict(self._packets)
 
     # ------------------------------------------------------------------ flows
     async def create_flow(self, flow_id: str | None, link: str) -> dict:
@@ -428,6 +613,11 @@ class DrillEngine:
                 "removal_id": active.id if buffering else None,
                 "packet": packet.to_dict(),
                 "flow": flow.to_dict(),
+                "link_state": (
+                    self.links[packet.link].to_dict(self._packets)
+                    if packet.link in self.links
+                    else None
+                ),
             }
 
     def _enqueue(self, packet: Packet, link_id: str) -> None:
@@ -436,6 +626,8 @@ class DrillEngine:
         packet.status = "queued"
         link.enqueued += 1
         link.queue.put_nowait(packet)
+        # Send immediately if a window slot is free.
+        self._pump_locked(link)
 
     # ------------------------------------------------------------ peer / views
     async def received_for_flow(self, flow_id: str) -> dict:
@@ -507,7 +699,8 @@ class DrillEngine:
             affected = [f for f in self.flows.values() if f.link == member_link]
             removal.affected_flow_ids = [f.id for f in affected]
             # Everything accepted on the member link before this request must be
-            # acknowledged by the peer before the flows may move.
+            # acknowledged by the peer before the flows may move. This includes
+            # queued and in-flight (delivering / physically delivered) packets.
             snapshot = [
                 p
                 for p in self._packets.values()
@@ -555,6 +748,9 @@ class DrillEngine:
                 continue
             if removal.status == "pending":
                 removal.snapshot_acked += 1
+                # Every snapshot packet must be acknowledged; an out-of-order
+                # ACK (e.g. a later packet confirmed first) never finishes the
+                # removal on its own.
                 if all(self._packet_acked(pid) for pid in removal.snapshot_packet_ids):
                     self._finish_removal(removal, "succeeded", "peer_confirmed")
             elif removal.status == "timed_out":
@@ -617,6 +813,7 @@ class DrillEngine:
         flushed.sort(key=lambda p: (p.flow_id, p.accept_index))
         for packet in flushed:
             packet.buffered_for_removal = None
+            # _enqueue pumps the window so flushed packets start as slots free.
             self._enqueue(packet, flush_link)
             removal.flushed_packet_ids.append(packet.id)
 
@@ -647,7 +844,9 @@ class DrillEngine:
         async with self._lock:
             active = self._active_removal()
             return {
-                "links": [self.links[lid].to_dict() for lid in LINK_IDS],
+                "links": [
+                    self.links[lid].to_dict(self._packets) for lid in LINK_IDS
+                ],
                 "flows": [flow.to_dict() for flow in self.flows.values()],
                 "active_removal": active.to_summary() if active else None,
                 "removal_count": len(self.removals),
@@ -677,5 +876,8 @@ class DrillEngine:
         async with self._lock:
             return {
                 "reset": True,
-                "links": [self.links[lid].to_dict() for lid in LINK_IDS],
+                "window_size": DEFAULT_WINDOW,
+                "links": [
+                    self.links[lid].to_dict(self._packets) for lid in LINK_IDS
+                ],
             }

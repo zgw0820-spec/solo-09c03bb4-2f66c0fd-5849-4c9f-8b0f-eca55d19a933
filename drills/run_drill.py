@@ -14,6 +14,8 @@ Scenarios:
             不会改变结果。
   buffer    缓冲上限为 1：第二个待迁包被拒收，其他流照发。
   reject2   第二个摘链申请在上一个未完成时被拒（一次只处理一个）。
+  window    发送窗口：默认 1，可在线设 1~64；查在途列表；多包在途显著提高
+            确认延时较大时的吞吐；后发先至仍按链路顺序交给收端。
 """
 
 from __future__ import annotations
@@ -198,6 +200,78 @@ SCENARIOS = {
 }
 
 
+def scenario_window(base: str) -> None:
+    print("\n== 场景 5：发送窗口（多包在途）==")
+    _, links = call(base, "GET", "/api/links", expect=200)
+    link_a = next(x for x in links["links"] if x["id"] == "A")
+    check("窗口默认 1 包", link_a["window_size"] == 1)
+    check("查询列出在途包（初始为空）", link_a["in_flight_packet_ids"] == [] and link_a["in_flight_count"] == 0)
+
+    _, updated = call(base, "PATCH", "/api/links/A", {"window_size": 8}, expect=200)
+    check("可在线把窗口设为 8", updated["window_size"] == 8)
+    call(base, "PATCH", "/api/links/A", {"window_size": 0}, expect=422)
+    call(base, "PUT", "/api/links/A/window", {"window": 65}, expect=422)
+    check("窗口超出 1~64 被拒绝（422）", True)
+
+    # In-flight listing is observable immediately after a burst.
+    call(base, "PATCH", "/api/links/A",
+         {"delivery_delay_ms": 20, "ack_delay_ms": 2000, "window_size": 4}, expect=200)
+    call(base, "POST", "/api/flows", {"flow_id": "winflight", "link": "A"}, expect=201)
+    sent_ids = []
+    for seq in range(1, 5):
+        _, pkt = call(base, "POST", "/api/flows/winflight/packets", {"seq": seq}, expect=201)
+        sent_ids.append(pkt["packet"]["packet_id"])
+    _, links = call(base, "GET", "/api/links", expect=200)
+    link_a = next(x for x in links["links"] if x["id"] == "A")
+    check("连发 4 包后列出 4 个在途包", link_a["in_flight_packet_ids"] == sent_ids,
+          f"in_flight={link_a['in_flight_packet_ids']}")
+
+    # Throughput: serial window=1 vs pipelined window=4, stream longer than W.
+    def burst(window: int, n: int = 8):
+        reset(base)
+        call(base, "PATCH", "/api/links/A",
+             {"delivery_delay_ms": 20, "ack_delay_ms": 250, "window_size": window}, expect=200)
+        call(base, "POST", "/api/flows", {"flow_id": "bench", "link": "A"}, expect=201)
+        started = time.monotonic()
+        for seq in range(1, n + 1):
+            call(base, "POST", "/api/flows/bench/packets", {"seq": seq}, expect=201)
+        order = wait_until(
+            lambda: (lambda o: o if len(o) == n else None)(received(base, "bench")),
+            timeout=10,
+        )
+        elapsed = time.monotonic() - started
+        return elapsed, order
+
+    serial_elapsed, serial_order = burst(1)
+    pipe_elapsed, pipe_order = burst(4)
+    check("窗口 1 时 8 包串行耗时 > 1.5s", serial_elapsed > 1.5, f"{serial_elapsed:.2f}s")
+    check("窗口 4 时耗时不到串行一半", pipe_elapsed * 2 < serial_elapsed,
+          f"window1={serial_elapsed:.2f}s window4={pipe_elapsed:.2f}s")
+    check("两种窗口下都按 1..8 顺序交给收端",
+          [x["seq"] for x in (serial_order or [])] == list(range(1, 9))
+          and [x["seq"] for x in (pipe_order or [])] == list(range(1, 9)))
+
+    # Out-of-order physical arrival still hands off in link order.
+    reset(base)
+    call(base, "PATCH", "/api/links/A",
+         {"delivery_delay_ms": 500, "ack_delay_ms": 60, "window_size": 2}, expect=200)
+    call(base, "POST", "/api/flows", {"flow_id": "reorder", "link": "A"}, expect=201)
+    call(base, "POST", "/api/flows/reorder/packets", {"seq": 1}, expect=201)
+    call(base, "PATCH", "/api/links/A", {"delivery_delay_ms": 40}, expect=200)
+    _, p2 = call(base, "POST", "/api/flows/reorder/packets", {"seq": 2}, expect=201)
+    p2_id = p2["packet"]["packet_id"]
+    time.sleep(0.2)
+    early = received(base, "reorder")
+    _, detail = call(base, "GET", f"/api/packets/{p2_id}", expect=200)
+    check("后发包先传完也不提前交给收端", early == [] and detail["handed_at"] is None,
+          f"received={len(early)} status={detail['status']}")
+    order = wait_until(
+        lambda: (lambda o: o if len(o) == 2 else None)(received(base, "reorder")),
+        timeout=5,
+    )
+    check("最终仍按 1,2 顺序送达", order is not None and [x["seq"] for x in order] == [1, 2])
+
+
 def scenario_after_removal(base: str) -> None:
     print("\n== 场景 4：摘链后成员链路已出组（reset 才能复原）==")
     call(base, "POST", "/api/flows", {"flow_id": "last", "link": "A"}, expect=201)
@@ -219,6 +293,8 @@ def scenario_after_removal(base: str) -> None:
 
 
 SCENARIOS["after_removal"] = scenario_after_removal
+# Keep window last so the printed 场景 1..5 order matches execution order.
+SCENARIOS["window"] = scenario_window
 
 
 def main() -> int:
